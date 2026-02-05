@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
-# OpenList TG Bot one-click installer (admin-only, multi-admin supported) -> /root/openlistbot
-# + Weekly log cleanup (journald vacuum)
+# OpenList TG Bot one-click installer -> /root/openlistbot
+# Features:
+# - Admin-only (supports multiple admin user IDs)
+# - Browse dirs (/ls) with inline buttons + remember last chosen dir
+# - Add offline download (/add <magnet|url>) -> /api/fs/add_offline_download
+# - Show progress (/progress) -> /api/admin/task/upload/undone
+# - Create folder (/mkdir /full/path/new_folder) -> /api/fs/mkdir
+# - Weekly journal cleanup (keep last 7 days of this service logs)
 #
 # Usage:
 #   chmod +x install.sh && sudo ./install.sh
@@ -45,6 +51,29 @@ install_deps() {
   ok "1) 安装依赖..."
   apt-get update -y
   apt-get install -y python3 python3-venv python3-pip curl ca-certificates
+}
+
+# 可选：清理编译/构建相关工具（避免占用空间）
+# 说明：如果你的服务器还需要编译别的程序，请在安装时选择不清理。
+cleanup_build_tools() {
+  [[ "${CLEAN_BUILD_TOOLS}" != "y" ]] && return 0
+  ok "(可选) 清理编译工具与无用依赖..."
+
+  # 这些包通常只在编译 Python 扩展或源码构建时需要
+  apt-get purge -y \
+    build-essential \
+    gcc g++ make cpp \
+    dpkg-dev \
+    python3-dev libpython3-dev \
+    pkg-config \
+    || true
+
+  apt-get autoremove -y || true
+  apt-get clean || true
+  rm -rf /var/lib/apt/lists/* || true
+
+  # 清理 pip 缓存（不影响 venv 内已安装的包）
+  rm -rf /root/.cache/pip || true
 }
 
 write_files() {
@@ -158,6 +187,13 @@ def fs_list(base: str, token: str, path: str, page: int, per_page: int) -> dict:
     r.raise_for_status()
     return r.json()
 
+def fs_mkdir(base: str, token: str, path: str) -> dict:
+    url = f"{base}/api/fs/mkdir"
+    payload = {"path": path}
+    r = requests.post(url, headers=ol_headers(token), json=payload, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
 def add_offline(base: str, token: str, path: str, urls: List[str], tool: str, delete_policy: str) -> dict:
     url = f"{base}/api/fs/add_offline_download"
     payload = {"path": path, "urls": urls, "tool": tool, "delete_policy": delete_policy}
@@ -166,10 +202,30 @@ def add_offline(base: str, token: str, path: str, urls: List[str], tool: str, de
     return r.json()
 
 def task_undone(base: str, token: str) -> dict:
-    url = f"{base}/api/admin/task/upload/undone"
-    r = requests.get(url, headers=ol_headers(token), timeout=20)
-    r.raise_for_status()
-    return r.json()
+    """获取未完成任务。
+
+    OpenList 的任务类型在不同版本/页面可能不同（download/offline/upload）。
+    这里按常见顺序依次尝试，取第一个成功且 data 有内容的结果。
+    """
+    endpoints = [
+        "/api/admin/task/download/undone",
+        "/api/admin/task/offline/undone",
+        "/api/admin/task/upload/undone",
+    ]
+    last = None
+    for ep in endpoints:
+        url = f"{base}{ep}"
+        try:
+            r = requests.get(url, headers=ol_headers(token), timeout=20)
+            r.raise_for_status()
+            j = r.json()
+            last = j
+            data = j.get("data")
+            if isinstance(data, list) and data:
+                return j
+        except Exception:
+            continue
+    return last or {"code": 500, "message": "task endpoint not found", "data": []}
 
 def build_dir_keyboard(path: str, items: List[dict], page: int, per_page: int, total: int) -> InlineKeyboardMarkup:
     btns: List[List[InlineKeyboardButton]] = []
@@ -208,7 +264,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "命令：\n"
         "/ls  浏览目录（从根目录开始）\n"
         "/add <磁力/链接>  选择目录后创建离线下载\n"
-        "/progress  查看当前任务进度\n\n"
+        "/progress  查看当前任务进度\n"
+        "/mkdir /完整路径/新文件夹  创建文件夹\n\n"
         f"上次目录：{last}"
     )
 
@@ -225,6 +282,30 @@ async def cmd_ls(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total = j.get("data", {}).get("total", len(content))
     kb = build_dir_keyboard(path, content, page, per_page, total)
     await update.message.reply_text(f"📂 当前：{path}\n（点文件夹进入，或直接选目录）", reply_markup=kb)
+
+async def cmd_mkdir(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cfg = context.bot_data["cfg"]
+    if not is_admin(cfg, update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("用法：/mkdir /完整路径/新文件夹名")
+        return
+    path = " ".join(context.args).strip()
+    base = norm_base(cfg["openlist"]["base_url"])
+    token = cfg["openlist"]["token"]
+    try:
+        j = fs_mkdir(base, token, path)
+    except requests.HTTPError as e:
+        await update.message.reply_text(f"❌ 创建失败：HTTP错误 {e}")
+        return
+    except Exception as e:
+        await update.message.reply_text(f"❌ 创建失败：{e}")
+        return
+
+    if j.get("code") == 200:
+        await update.message.reply_text(f"✅ 已创建：{path}")
+    else:
+        await update.message.reply_text(f"❌ 创建失败：{j}")
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cfg = context.bot_data["cfg"]
@@ -336,6 +417,7 @@ def main():
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("ls", cmd_ls))
+    app.add_handler(CommandHandler("mkdir", cmd_mkdir))
     app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("progress", cmd_progress))
     app.add_handler(CallbackQueryHandler(on_cb))
@@ -368,6 +450,11 @@ configure() {
   prompt OL_TOOL "默认离线工具（qBittorrent / aria2 / SimpleHttp）" "qBittorrent"
   prompt OL_DEL "delete_policy（不确定就 no）" "no"
 
+  # 仅影响本次安装流程，不写入配置文件
+  local CLEAN_BUILD_TOOLS_LOCAL
+  prompt CLEAN_BUILD_TOOLS_LOCAL "安装完成后清理编译工具/无用依赖？(y/n)" "y"
+  CLEAN_BUILD_TOOLS="${CLEAN_BUILD_TOOLS_LOCAL,,}"
+
   python3 - <<PY
 import yaml, re
 cfg_path="${CFG_FILE}"
@@ -381,7 +468,7 @@ if s:
         x=x.strip()
         if not x:
             continue
-        if re.fullmatch(r"\\d+", x):
+        if re.fullmatch(r"\d+", x):
             admins.append(int(x))
 cfg['telegram']['admin_user_ids']=admins
 
@@ -465,6 +552,7 @@ finish() {
   echo "Telegram（只有管理员ID可用）："
   echo "  /start"
   echo "  /ls"
+  echo "  /mkdir /完整路径/新文件夹"
   echo "  /add magnet:..."
   echo "  /progress"
 }
@@ -477,6 +565,7 @@ main() {
   configure
   install_service
   install_logclean
+  cleanup_build_tools
   finish
 }
 
